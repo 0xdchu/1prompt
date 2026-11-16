@@ -79,8 +79,8 @@ or reconfigure, keep a list in `~/.claude/boundary-paths.txt`. Put one entry on 
 # refused as a write target but not watched: another process writes there while a run goes on
 nowatch:~/.local/share/my-service
 # a systemd user unit: every systemctl verb but the read-only ones (status, show, cat, is-active, list-…) is
-# refused, and so are verbs that stop every unit (exit, isolate); its unit file and drop-in folder in
-# ~/.config/systemd/user are protected like a listed path
+# refused, and so are verbs that act on every unit (exit, isolate, preset-all); its unit file and every drop-in
+# folder systemd reads for it in ~/.config/systemd/user are protected like a listed path
 unit:my-service.service
 ```
 
@@ -151,7 +151,8 @@ reviewer report any change to it. The module docstring in `hooks/agent-guard.py`
   some other way (a variable other than `$HOME`, a brace expansion, a symlink you made yourself), or an interpreter
   that writes into a `nowatch:` folder, gets past it; a watched path is still reported after the call. Paths are
   compared case-sensitively and from `HOME`, so on Windows and macOS, where file names ignore case, spell them as they
-  are on disk.
+  are on disk. For units only `systemctl` is read: `kill`/`pkill`, `busctl` or `loginctl` reach a unit past it, and a
+  unit's files are looked for in `$XDG_CONFIG_HOME` (or `~/.config`) `/systemd/user` only.
 - The task contract sees a tree once a call names it (its cwd, a path argument, an absolute path or a `cd` in a
   command); a write into a tree no call ever names, or a shell write outside every git tree, is not seen. Its state
   lives in the temp folder, where a builder working to get around it could change it.

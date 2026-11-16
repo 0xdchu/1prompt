@@ -373,12 +373,12 @@ SYSTEMCTL_READ = {"status", "show", "cat", "is-active", "is-enabled", "is-failed
                   "list-unit-files", "list-dependencies", "list-timers", "list-sockets", "list-jobs", "list-paths",
                   "list-automounts", "help", "show-environment", "get-default"}
 SYSTEMCTL_ALL = {"exit", "isolate", "halt", "poweroff", "reboot", "soft-reboot", "kexec", "switch-root", "default",
-                 "rescue", "emergency", "suspend", "hibernate"}
+                 "rescue", "emergency", "suspend", "hibernate", "preset-all"}
 SYSTEMCTL_VALUE = {"-t", "--type", "-s", "--signal", "--job-mode", "-p", "--property", "-H", "--host", "-M",
                    "--machine", "--root", "-n", "--lines", "-o", "--output", "--what", "--state", "--kill-whom",
                    "--kill-value", "--timestamp", "--image", "--drop-in", "--reboot-argument", "--message", "--when",
-                   "--preset-mode"}
-INTERPRETER = re.compile(r"(python|node|perl|ruby|php|deno|bun|lua|osascript)[\d.]*$")
+                   "--preset-mode", "-C", "--capsule", "-P", "--kill-subgroup"}
+MESSAGE_TOOLS = {"git", "gh", "bd"}
 RUNNERS = {"npx": 1, "bunx": 1, "uvx": 1, "xcrun": 1, ("pnpm", "dlx"): 1, ("pipx", "run"): 1, ("uv", "run"): 1,
            ("poetry", "run"): 1, ("npm", "exec"): 1, ("yarn", "dlx"): 1}
 RUN_TARGETS = set(PUBLISH) | SIGNERS | {"gpg", "openssl", "git", "gh", "bd", "vercel", "netlify", "dotnet", "rm",
@@ -451,8 +451,8 @@ def check_boundary(name, args, words, command):
             raise Blocked(f"`{w}` is key or credential material; in an autonomous run only the owner handles it")
         if GUARD_PATH.search(w) and name not in READERS:
             raise Blocked(f"`{w}` is part of the guard's own wiring; an autonomous run does not change it")
-        listed = host_named(w) if name not in READERS and (INTERPRETER.match(name) or not re.search(r"\s", w)) \
-            else None  # a message or PR body with spaces only names a path; an interpreter's code may write it
+        listed = host_named(w) if name not in READERS and not (name in MESSAGE_TOOLS and re.search(r"\s", w)) \
+            else None  # a commit, PR or bead text with spaces only names a path; any other command's text may write it
         if listed:
             raise Blocked(f"`{name}` names {listed}, which the owner listed in {HOST_LIST}; an autonomous run only "
                           "reads it (cat, grep, ls…)")
@@ -470,15 +470,21 @@ def check_boundary(name, args, words, command):
             check_boundary(program(tail[j]), tail[j + 1:], words, command)
         return
     if name in ("rm", "rmdir", "unlink", "mv", "truncate", "shred", "touch", "install", "chmod", "chown"):
-        named = [a for a in args if not a.startswith("-")]
-        for j, a in enumerate(named):  # the target of mv/install is written into, not taken away
-            boundary_path(a, CONTEXT["cwd"], holds=not (name in ("mv", "install") and j == len(named) - 1 and j))
+        target_dir = [args[j + 1] for j, a in enumerate(args[:-1]) if a in ("-t", "--target-directory")] + \
+            [a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")]
+        named = [a for j, a in enumerate(args) if not a.startswith("-") and args[j - 1:j] not in (["-t"], ["--target-directory"])]
+        for j, a in enumerate(named):  # the target of mv/install is written into, not taken away; with -t every name is a source
+            last = name in ("mv", "install") and not target_dir and j == len(named) - 1 and j
+            boundary_path(a, CONTEXT["cwd"], holds=not last)
+        for a in target_dir:
+            boundary_path(a, CONTEXT["cwd"], holds=False)
     if name == "ln" and [a for a in args if not a.startswith("-")]:
         boundary_path([a for a in args if not a.startswith("-")][-1], CONTEXT["cwd"], holds=False)  # the link written
     if name in ("cp", "rsync", "dd") and args:
         target = [a for a in args if not a.startswith("-")][-1:] or [""]
         target = [a[3:] for a in args if a.startswith("of=")] or target
-        boundary_path(target[0], CONTEXT["cwd"], holds=False) if target[0] else None
+        deletes = name == "rsync" and any(a.startswith(("--delete", "--del", "--remove-source")) for a in args)
+        boundary_path(target[0], CONTEXT["cwd"], holds=deletes) if target[0] else None
     if name in ("sed", "perl") and any(re.fullmatch(r"-[a-zA-Z]*i.*|--in-place.*", a) for a in args):
         files = [a for a in args if not a.startswith("-")]
         for a in files[0 if "-e" in args or "-pe" in args else 1:]:
@@ -876,32 +882,39 @@ def guard_fingerprint():
         name = os.path.relpath(path, home)
         if (name.startswith("settings") and name.endswith(".json")) or name.startswith(("hooks", "agents")) or \
                 name == os.path.basename(HOST_LIST):
-            names.append(f"{name} {file_digest(path)}")
+            names.append(f"{name} {wiring_digest(path)}")
     try:
         entries = host_entries()[0]
     except Blocked:
         entries = []
         names.append(f"{HOST_LIST} unreadable")
-    skip = [real for real, _, watched in entries if not watched]
+    def watched_here(path):  # the deepest entry that holds the path decides (a nowatch folder in a watched one…)
+        holders = [(len(real), watched) for real, _, watched in entries
+                   if path == real or path.startswith(real.rstrip(os.sep) + os.sep)]
+        return max(holders)[1] if holders else False
+    seen = set()
     for top in sorted({real for real, _, watched in entries if watched}):
         found = [top] if not os.path.isdir(top) else sorted(
             os.path.join(root, n) for root, _, ns in os.walk(top) for n in ns)
         for path in found:
-            if not any(path == s or path.startswith(s.rstrip(os.sep) + os.sep) for s in skip):
-                names.append(f"host:{path} {file_digest(path)}")
+            if path not in seen and watched_here(path):
+                seen.add(path)
+                names.append(f"host:{path} {wiring_digest(path)}")
     for name in names:
         digest.update(name.encode() + b"\0")
     return {"status": names, "digest": digest.hexdigest()}
 
 
-def file_digest(path):
+def wiring_digest(path):
+    """A short digest of what the file holds, read through a symlink, plus where a symlink points."""
+    link = f" -> {os.readlink(path)}" if os.path.islink(path) else ""
     try:
         with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:12]
+            return hashlib.sha256(f.read()).hexdigest()[:12] + link
     except FileNotFoundError:
-        return "missing"
+        return "missing" + link
     except OSError:
-        return "unreadable"
+        return "unreadable" + link
 
 
 def host_entries():
@@ -924,8 +937,14 @@ def host_entries():
             unit = line[5:].strip()
             unit = unit if "." in unit else unit + ".service"
             units.append(unit)
-            for name in (unit, unit + ".d"):
-                path = os.path.join(os.path.expanduser("~/.config/systemd/user"), name)
+            stem, kind = unit.rsplit(".", 1)
+            parts = stem.split("-")
+            # systemd reads <unit>.d, every dash prefix's <a>-.<type>.d and the type-wide <type>.d
+            names = [unit, unit + ".d", f"{kind}.d"] + [
+                "-".join(parts[:i]) + f"-.{kind}.d" for i in range(1, len(parts))]
+            config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+            for name in names:
+                path = os.path.join(config, "systemd", "user", name)
                 paths.append((os.path.realpath(path), path, True))
             continue
         watched = not line.startswith("nowatch:")
@@ -949,9 +968,10 @@ def host_forms(path):
 def host_named(word):
     """The listed path a command word names, as a whole path or a path inside it (also inside a string such as
     python -c "open('...')"); `~/svc2` does not name `~/svc`."""
+    words = {word, re.sub(r"^-[A-Za-z]", "", word)}  # `curl -o/path`: a short option glued to its value
     for real, spelled, _ in host_entries()[0]:
         for form in host_forms(real) | host_forms(spelled):
-            if re.search(r"(?<![\w.~/$-])" + re.escape(form) + r"(?![\w.-])", word):
+            if any(re.search(r"(?<![\w.~/$-])" + re.escape(form) + r"(?![\w.-])", w) for w in words):
                 return real
     return None
 
@@ -976,7 +996,7 @@ def host_unit(args):
         base = os.path.basename(name)
         base = base if "." in base or re.search(r"[*?\[]", base) else base + ".service"
         for unit in units:
-            if fnmatch(unit, base) or fnmatch(unit, os.path.basename(name)):
+            if fnmatch(unit, base):
                 return unit
     return None
 
@@ -2363,17 +2383,20 @@ def host_list_test():
     command words and in systemctl; reading, look-alike names, messages and copies into home pass; a watched path
     changed by an interpreter is reported by name, a nowatch folder is not (also nested in a watched one), and a list
     that cannot be read blocks every command but reading."""
-    bad, saved_home, saved_cwd = [], os.environ.get("HOME"), CONTEXT["cwd"]
+    global HOST_LIST
+    bad, saved_home, saved_cwd, saved_list = [], os.environ.get("HOME"), CONTEXT["cwd"], HOST_LIST
+    HOST_LIST = "~/.claude/boundary-paths.txt"  # under the scratch home below
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.realpath(os.path.join(tmp, "home"))
         os.environ["HOME"] = home
         for folder in (".claude", "svc/data", "svc2", "other", "wfold/inner", ".config/systemd/user"):
             os.makedirs(os.path.join(home, folder))
-        for rel in ("svc/allow.json", "svc/data/q.json", ".claude/settings.json", "wfold/a.txt", "wfold/inner/b.txt",
-                    "real.json"):
+        for rel in ("svc/allow.json", "svc/data/q.json", "svc/data/watched.json", ".claude/settings-target.json",
+                    "wfold/a.txt", "wfold/inner/b.txt", "real.json"):
             with open(os.path.join(home, rel), "w") as f:
                 f.write("{}")
         os.symlink(os.path.join(home, "svc"), os.path.join(home, "lnk"))
+        os.symlink(os.path.join(home, ".claude", "settings-target.json"), os.path.join(home, ".claude", "settings.json"))
         CONTEXT["cwd"] = os.path.join(home, "other")
         listing = os.path.join(home, ".claude", "boundary-paths.txt")
 
@@ -2401,7 +2424,8 @@ def host_list_test():
         expect("an edit with no list", edit("~/svc/allow.json"), False)
         expect("a stop with no list", cmd("systemctl --user stop svc-listen"), False)
         write_list("# owner's list\n~/svc/allow.json  # allowlist\nnowatch:~/svc/data\n~/wfold\nnowatch:~/wfold/inner\n"
-                   f"~/lnk/linked.json\n{home}/real.json\nunit:other-unit.service # note\nunit:svc-listen\n")
+                   f"~/lnk/linked.json\n{home}/real.json\nunit:other-unit.service # note\nunit:svc-listen\n"
+                   "~/svc/data/watched.json\n")
         for label, call, want in (
                 ("an edit of a listed file", edit("~/svc/allow.json"), True),
                 ("a write into a nowatch folder", edit(os.path.join(home, "svc/data/new.json")), True),
@@ -2409,6 +2433,9 @@ def host_list_test():
                 ("an edit through the realpath of a symlinked entry", edit("~/svc/linked.json"), True),
                 ("an edit of a listed unit's file", edit("~/.config/systemd/user/svc-listen.service"), True),
                 ("a drop-in for a listed unit", edit("~/.config/systemd/user/svc-listen.service.d/x.conf"), True),
+                ("a dash-prefix drop-in", edit("~/.config/systemd/user/svc-.service.d/x.conf"), True),
+                ("a type-wide drop-in", edit("~/.config/systemd/user/service.d/x.conf"), True),
+                ("an edit spelled with ${HOME}", edit("${HOME}/svc/allow.json"), True),
                 ("an edit of a look-alike folder", edit("~/svc2/x.txt"), False),
                 ("an edit of a look-alike file", edit("~/svc/allow.json.bak"), False),
                 ("an edit of a look-alike of a nowatch folder", edit("~/svc/data2/x.json"), False),
@@ -2433,7 +2460,15 @@ def host_list_test():
                 ("cat ~/svc/allow.json", False), ("ls ~/svc/data", False), ("grep -c x ~/svc/data/q.json", False),
                 ("systemctl --user status svc-listen", False), ("systemctl --user stop third-unit", False),
                 ("echo x > ~/other/notes.txt", False), ("rm -rf ~/other", False), ("touch ~/svc2/x.txt", False),
-                ("python3 ~/svc2/run.py", False), ("python3 tool.py ~/svc/data2/x.json", False),
+                ("python3 ~/svc2/run.py", False), ("mv -t ~/other ~/svc", True), ("mv -t ~/other a.txt ~/svc", True), ("mv -t ~/svc/data a.txt", True),
+                ("mv --target-directory=~/other ~/svc/allow.json", True), ("rsync -a --delete src/ ~/", True),
+                ("rsync -a src/ ~/other/", False), ("systemctl --user link /x/svc-listen.service", True),
+                ("systemctl --user isolate default.target", True), ("systemctl --user preset-all", True),
+                ("systemctl --user -C cap stop svc-listen", True), ("systemctl --user -P Id show svc-listen", False),
+                ("systemctl --user -C cap status svc-listen", False),
+                ("echo x > ${HOME}/svc/allow.json", True),
+                ("node -e \"require('fs').writeFileSync('$HOME/svc/allow.json', '')\"", True),
+                ("awk 'BEGIN{print 1 > \"~/svc/allow.json\"}'", True), (f"curl -o{home}/svc/allow.json u", True), ("python3 tool.py ~/svc/data2/x.json", False),
                 ("python3 tool.py ~/svc/allow.json.bak", False), ("systemctl --user -p Id show svc-listen", False), ("cp a.txt ~/", False), ("mv a.txt ~/", False),
                 ("gh pr create --title t --body 'edits ~/svc/allow.json later'", False)):
             expect(repr(command), cmd(command), want)
@@ -2463,6 +2498,17 @@ def host_list_test():
         step("a listed path that did not exist", create("svc/linked.json"), True, "svc/linked.json")
         step("a listed unit file created", create(".config/systemd/user/svc-listen.service"), True)
         step("the list itself", append(".claude/boundary-paths.txt"), True, "boundary-paths.txt")
+        step("a watched file inside a nowatch folder", append("svc/data/watched.json"), True, "watched.json")
+        step("the guard's settings edited through a symlink", append(".claude/settings-target.json"), True,
+             "settings.json")
+
+        def retarget():
+            other = os.path.join(home, ".claude", "settings-other.json")
+            with open(os.path.join(home, ".claude", "settings-target.json")) as f, open(other, "w") as g:
+                g.write(f.read())
+            os.remove(os.path.join(home, ".claude", "settings.json"))
+            os.symlink(other, os.path.join(home, ".claude", "settings.json"))
+        step("the guard's settings re-pointed to a copy", retarget, True, "settings.json")
         write_list("svc/relative\n")
         expect("any write while the list holds a relative path", edit("~/other/notes.txt"), True)
         expect("git status while the list holds a relative path", cmd("git status"), True)
@@ -2472,6 +2518,7 @@ def host_list_test():
         expect("a write while the list cannot be read", edit("~/other/notes.txt"), True)
         if "boundary-paths.txt unreadable" not in " ".join(guard_fingerprint()["status"]):
             bad.append("host watch: an unreadable list is not named in the guard fingerprint")
+    HOST_LIST = saved_list
     if saved_home is None:
         os.environ.pop("HOME", None)
     else:
@@ -2481,6 +2528,18 @@ def host_list_test():
 
 
 def self_test():
+    """Every case but the host-list test runs with no host list, so the owner's own list cannot change the result."""
+    global HOST_LIST
+    saved = HOST_LIST
+    with tempfile.TemporaryDirectory() as tmp:
+        HOST_LIST = os.path.join(tmp, "absent", "boundary-paths.txt")
+        try:
+            return run_self_test()
+        finally:
+            HOST_LIST = saved
+
+
+def run_self_test():
     bad = []
     for mode, command, want in CASES:
         try:

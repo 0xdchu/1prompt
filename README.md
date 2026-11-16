@@ -67,6 +67,24 @@ claude --settings hooks/autonomous-settings.json
 The file is not loaded in interactive sessions, where you are present, so they behave as before. The hooks apply
 to the main session and to every subagent of the run.
 
+### Paths outside your repos
+
+Protected paths in a repo come from `.claude/boundary.json`. For files outside every repo that an unattended run
+must leave alone (a service's allowlist, its budget ledger, its installed code) and user services it must not stop
+or reconfigure, keep a list in `~/.claude/boundary-paths.txt`. Put one entry on each line and start a comment with `#`:
+
+```text
+# a file or folder: refused as a write target, and any change to it is reported after each tool call
+~/.config/my-service/allowlist.json
+# refused as a write target but not watched: another process writes there while a run goes on
+nowatch:~/.local/share/my-service
+# a systemd user unit: stop, disable, mask, edit, restart and the like are refused (status and show pass)
+unit:my-service.service
+```
+
+The list is part of the guard's wiring: a run cannot edit it, and any change to it is reported. If the list cannot be
+read, or a line holds a relative path, writes are refused until you fix it.
+
 ## Build and review modes in a subagent
 
 A builder or reviewer subagent can carry the stricter hooks in its own frontmatter. For a builder
@@ -126,6 +144,9 @@ reviewer report any change to it. The module docstring in `hooks/agent-guard.py`
   rights cannot change them. Set them with `scripts/github-boundary.py` (see its docstring; `--apply` writes as the
   owner account only). GitHub refuses rulesets on private repos without a paid plan; the script reports that.
 - Work-tree watches compare git state before and after, so files git ignores (build output) are not covered.
+- The host list in `~/.claude/boundary-paths.txt` is checked the same way: a command that spells a listed path
+  some other way (a variable, a relative path from elsewhere, a symlink), or a `nowatch:` folder written by an
+  interpreter, gets past it.
 - The task contract sees a tree once a call names it (its cwd, a path argument, an absolute path or a `cd` in a
   command); a write into a tree no call ever names, or a shell write outside every git tree, is not seen. Its state
   lives in the temp folder, where a builder working to get around it could change it.

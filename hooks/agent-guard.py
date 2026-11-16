@@ -360,8 +360,14 @@ SECRET_PATH = re.compile(r"(^|[/=])\.ssh/|id_(rsa|ed25519|ecdsa|dsa)\b|\.(pem|p1
                          r"(^|/)secrets?/|\.config/gh/hosts\.yml|\.netrc|\.git-credentials|\.npmrc|\.pypirc|"
                          r"\.docker/config\.json|\.beads-credential-key|(^|/)\.env(\.local|\.production|\.development)?$")
 # the guard's own wiring: an autonomous run never edits it
-GUARD_PATH = re.compile(r"\.claude/(settings[^/]*\.json|hooks(/|$)|agents(/|$))|1prompt/hooks/|"
+GUARD_PATH = re.compile(r"\.claude/(settings[^/]*\.json|hooks(/|$)|agents(/|$)|boundary-paths\.txt$)|1prompt/hooks/|"
                         r"(^|/)\.claude/boundary\.json$")
+# The owner's host paths and user units outside every repo (a service the run must not reconfigure, its allowlist,
+# its budget ledger): one entry per line, `#` comments. `unit:<name>` names a systemd user unit; `nowatch:<path>` is
+# refused as a write target but not fingerprinted (a folder another process keeps writing while a run goes on).
+HOST_LIST = "~/.claude/boundary-paths.txt"
+UNIT_CHANGE = {"stop", "disable", "mask", "kill", "edit", "revert", "restart", "try-restart", "reload-or-restart",
+               "set-property", "link", "enable", "preset", "reenable", "freeze"}
 RUNNERS = {"npx": 1, "bunx": 1, "uvx": 1, "xcrun": 1, ("pnpm", "dlx"): 1, ("pipx", "run"): 1, ("uv", "run"): 1,
            ("poetry", "run"): 1, ("npm", "exec"): 1, ("yarn", "dlx"): 1}
 RUN_TARGETS = set(PUBLISH) | SIGNERS | {"gpg", "openssl", "git", "gh", "bd", "vercel", "netlify", "dotnet", "rm",
@@ -434,6 +440,14 @@ def check_boundary(name, args, words, command):
             raise Blocked(f"`{w}` is key or credential material; in an autonomous run only the owner handles it")
         if GUARD_PATH.search(w) and name not in READERS:
             raise Blocked(f"`{w}` is part of the guard's own wiring; an autonomous run does not change it")
+        listed = host_named(w) if name not in READERS else None
+        if listed:
+            raise Blocked(f"`{name}` names {listed}, which the owner listed in {HOST_LIST}; an autonomous run only "
+                          "reads it (cat, grep, ls…)")
+    if name == "systemctl":
+        unit = host_unit(args)
+        if unit:
+            raise Blocked(f"`systemctl {' '.join(args)}` changes {unit}, a unit the owner listed in {HOST_LIST}")
     first = args[0] if args else ""
     runner = RUNNERS.get(name) or RUNNERS.get((name, first))
     if runner:  # npx vsce publish, xcrun --sdk x codesign, uv run --with twine twine upload: check what it runs
@@ -848,14 +862,89 @@ def guard_fingerprint():
             files += [os.path.join(root, n) for n in sorted(found)]
     for path in files:
         name = os.path.relpath(path, home)
-        if (name.startswith("settings") and name.endswith(".json")) or name.startswith(("hooks", "agents")):
+        if (name.startswith("settings") and name.endswith(".json")) or name.startswith(("hooks", "agents")) or \
+                name == os.path.basename(HOST_LIST):
             try:
                 with open(path, "rb") as f:
                     digest.update(name.encode() + b"\0" + f.read())
                 names.append(name)
             except OSError:
                 digest.update(f"unreadable {name}".encode())
+    try:
+        listed = [p for p, watched in host_entries()[0] if watched]
+    except Blocked:
+        listed = []
+        digest.update(b"unreadable host list")
+    for top in listed:
+        found = [top] if not os.path.isdir(top) else sorted(
+            os.path.join(root, n) for root, _, ns in os.walk(top) for n in ns)
+        for path in found:
+            try:
+                with open(path, "rb") as f:
+                    digest.update(f"host:{path}".encode() + b"\0" + f.read())
+                names.append(f"host:{path}")
+            except FileNotFoundError:
+                digest.update(f"missing {path}".encode())
+            except OSError:
+                digest.update(f"unreadable {path}".encode())
     return {"status": names, "digest": digest.hexdigest()}
+
+
+def host_entries():
+    """The owner's host list: ([(real path, watched)], [unit names]). A missing list is empty; one that cannot be read
+    or holds a relative path blocks, like any input the guard cannot parse."""
+    try:
+        with open(os.path.expanduser(HOST_LIST), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return [], []
+    except (OSError, UnicodeDecodeError) as e:
+        raise Blocked(f"could not read {HOST_LIST} ({type(e).__name__}); the owner's host paths cannot be checked")
+    paths, units = [], []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("unit:"):
+            units.append(line[5:].strip())
+            continue
+        watched = not line.startswith("nowatch:")
+        path = os.path.expanduser(line if watched else line[8:].strip())
+        if not os.path.isabs(path):
+            raise Blocked(f"{HOST_LIST}: {line!r} is not an absolute path")
+        paths.append((os.path.realpath(path), watched))
+    return paths, units
+
+
+def host_forms(path):
+    """How a command can spell a listed path: as is, and from home as `~/x` and `$HOME/x`."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    forms = [path]
+    if path.startswith(home + os.sep):
+        rel = path[len(home) + 1:]
+        forms += [f"~/{rel}", f"$HOME/{rel}", f"${{HOME}}/{rel}"]
+    return forms
+
+
+def host_named(word):
+    """The listed path a command word names (also inside a longer string such as python -c "open('...')")."""
+    for path, _ in host_entries()[0]:
+        if any(form in word for form in host_forms(path)):
+            return path
+    return None
+
+
+def host_unit(args):
+    """`systemctl --user stop|disable|edit… <unit>` of a unit the owner listed."""
+    units = host_entries()[1]
+    verbs = [a for a in args if not a.startswith("-")]
+    if not units or not verbs or verbs[0] not in UNIT_CHANGE:
+        return None
+    for name in verbs[1:]:
+        for unit in units:
+            if name in (unit, unit + ".service") or unit == name + ".service":
+                return unit
+    return None
 
 
 def boundary_path(path, cwd):
@@ -867,6 +956,11 @@ def boundary_path(path, cwd):
         raise Blocked(f"{path} is part of the guard's own wiring; an autonomous run does not change it")
     if SECRET_PATH.search(full):
         raise Blocked(f"{path} is key or credential material; in an autonomous run only the owner handles it")
+    for listed, _ in host_entries()[0]:
+        if full == listed or full.startswith(listed.rstrip(os.sep) + os.sep) or full == os.sep or \
+                listed.startswith(full.rstrip(os.sep) + os.sep):
+            raise Blocked(f"{path} is or holds {listed}, which the owner listed in {HOST_LIST}; an autonomous run "
+                          "does not change it")
     top = work_tree(full)
     if not top:
         return
@@ -2215,6 +2309,82 @@ def contract_test():
     return bad
 
 
+def host_list_test():
+    """The owner's host list on a scratch home: listed paths and units are refused as write targets, in edits, in
+    command words and in systemctl; reading passes; a watched path changed by an interpreter is reported, a nowatch
+    folder is not, and neither is anything when the list is absent."""
+    bad, saved_home, saved_cwd = [], os.environ.get("HOME"), CONTEXT["cwd"]
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.realpath(os.path.join(tmp, "home"))
+        os.environ["HOME"] = home
+        for folder in (".claude", "svc/data", "other"):
+            os.makedirs(os.path.join(home, folder))
+        for rel in ("svc/allow.json", "svc/data/q.json", ".claude/settings.json"):
+            with open(os.path.join(home, rel), "w") as f:
+                f.write("{}")
+        CONTEXT["cwd"] = os.path.join(home, "other")
+
+        def expect(label, call, want):
+            try:
+                call()
+                got = False
+            except Blocked:
+                got = True
+            if got != want:
+                bad.append(f"host list: {label} {'blocked' if got else 'allowed'}, expected {'blocked' if want else 'allowed'}")
+
+        def edit(path):
+            return lambda: boundary_edit({"cwd": CONTEXT["cwd"], "tool_input": {"file_path": path}})
+
+        expect("an edit with no list", edit("~/svc/allow.json"), False)
+        expect("a stop with no list", lambda: check("systemctl --user stop svc-listen", "boundary"), False)
+        with open(os.path.join(home, ".claude", "boundary-paths.txt"), "w") as f:
+            f.write("# owner's list\n~/svc/allow.json\nnowatch:~/svc/data\nunit:svc-listen\n")
+        for label, call in (("an edit of a listed file", edit("~/svc/allow.json")),
+                            ("a write into a nowatch folder", edit(os.path.join(home, "svc/data/new.json"))),
+                            ("an edit of the list itself", edit("~/.claude/boundary-paths.txt"))):
+            expect(label, call, True)
+        for command, want in (("rm -rf ~/svc", True), ("echo x > ~/svc/allow.json", True),
+                              ("cp a.json ~/svc/data/", True), ("sed -i s/a/b/ ~/svc/allow.json", True),
+                              ("python3 -c \"open('$HOME/svc/allow.json', 'w')\"", True),
+                              (f"python3 tool.py {home}/svc/data/q.json", True),
+                              ("systemctl --user stop svc-listen", True),
+                              ("systemctl --user disable --now svc-listen.service", True),
+                              ("systemctl --user edit svc-listen", True),
+                              ("cat ~/svc/allow.json", False), ("ls ~/svc/data", False),
+                              ("grep -c x ~/svc/data/q.json", False), ("systemctl --user status svc-listen", False),
+                              ("systemctl --user stop other-unit", False), ("echo x > ~/other/notes.txt", False),
+                              ("rm -rf ~/other", False)):
+            expect(repr(command), lambda: check(command, "boundary"), want)
+        expect("an edit elsewhere", edit("~/other/notes.txt"), False)
+
+        def step(label, act, want):
+            event = {"session_id": f"self-test-h-{os.getpid()}-{label[:12]}", "agent_id": "t", "cwd": CONTEXT["cwd"],
+                     "tool_name": "Bash", "tool_input": {"command": "true"}}
+            watch(event, "boundary")
+            act()
+            found, _ = changes(event, "boundary")
+            if bool(found) != want:
+                bad.append(f"host watch: {label} {'reported' if found else 'not reported'}, expected the opposite")
+            os.remove(state_file(event, "boundary"))
+
+        def append(rel):
+            return lambda: open(os.path.join(home, rel), "a").write(" ")
+        step("a watched file written by an interpreter", append("svc/allow.json"), True)
+        step("a file in a nowatch folder", append("svc/data/q.json"), False)
+        step("a file nobody listed", append("other/x.txt"), False)
+        step("the list itself", append(".claude/boundary-paths.txt"), True)
+        with open(os.path.join(home, ".claude", "boundary-paths.txt"), "w") as f:
+            f.write("svc/relative\n")
+        expect("any write while the list holds a relative path", edit("~/other/notes.txt"), True)
+    if saved_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = saved_home
+    CONTEXT["cwd"] = saved_cwd
+    return bad
+
+
 def self_test():
     bad = []
     for mode, command, want in CASES:
@@ -2228,11 +2398,12 @@ def self_test():
     bad += watch_test()
     bad += boundary_test()
     bad += protected_watch_test()
+    bad += host_list_test()
     bad += contract_test()
     for line in bad:
         print(f"- {line}")
     print(f"{'FAIL' if bad else 'PASS'}: {len(CASES)} command cases, the work-tree watch and {len(BOUNDARY_CASES)} "
-          f"boundary cases, the protected-path watch and the task contract, {len(bad)} failures")
+          f"boundary cases, the protected-path watch, the owner's host list and the task contract, {len(bad)} failures")
     return 1 if bad else 0
 
 

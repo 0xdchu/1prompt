@@ -470,9 +470,10 @@ def check_boundary(name, args, words, command):
             check_boundary(program(tail[j]), tail[j + 1:], words, command)
         return
     if name in ("rm", "rmdir", "unlink", "mv", "truncate", "shred", "touch", "install", "chmod", "chown"):
-        target_dir = [args[j + 1] for j, a in enumerate(args[:-1]) if a in ("-t", "--target-directory")] + \
+        takes_dir = [j for j, a in enumerate(args[:-1]) if a == "--target-directory" or re.fullmatch(r"-[a-zA-Z]*t", a)]
+        target_dir = [args[j + 1] for j in takes_dir] + \
             [a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")]
-        named = [a for j, a in enumerate(args) if not a.startswith("-") and args[j - 1:j] not in (["-t"], ["--target-directory"])]
+        named = [a for j, a in enumerate(args) if not a.startswith("-") and j - 1 not in takes_dir]
         for j, a in enumerate(named):  # the target of mv/install is written into, not taken away; with -t every name is a source
             last = name in ("mv", "install") and not target_dir and j == len(named) - 1 and j
             boundary_path(a, CONTEXT["cwd"], holds=not last)
@@ -483,8 +484,11 @@ def check_boundary(name, args, words, command):
     if name in ("cp", "rsync", "dd") and args:
         target = [a for a in args if not a.startswith("-")][-1:] or [""]
         target = [a[3:] for a in args if a.startswith("of=")] or target
-        deletes = name == "rsync" and any(a.startswith(("--delete", "--del", "--remove-source")) for a in args)
+        deletes = name == "rsync" and any(a.startswith(("--delete", "--del")) for a in args)
         boundary_path(target[0], CONTEXT["cwd"], holds=deletes) if target[0] else None
+        if name == "rsync" and any(a.startswith("--remove-source") for a in args):  # the sources are taken away
+            for a in [a for a in args if not a.startswith("-")][:-1]:
+                boundary_path(a, CONTEXT["cwd"])
     if name in ("sed", "perl") and any(re.fullmatch(r"-[a-zA-Z]*i.*|--in-place.*", a) for a in args):
         files = [a for a in args if not a.startswith("-")]
         for a in files[0 if "-e" in args or "-pe" in args else 1:]:
@@ -2460,7 +2464,9 @@ def host_list_test():
                 ("cat ~/svc/allow.json", False), ("ls ~/svc/data", False), ("grep -c x ~/svc/data/q.json", False),
                 ("systemctl --user status svc-listen", False), ("systemctl --user stop third-unit", False),
                 ("echo x > ~/other/notes.txt", False), ("rm -rf ~/other", False), ("touch ~/svc2/x.txt", False),
-                ("python3 ~/svc2/run.py", False), ("mv -t ~/other ~/svc", True), ("mv -t ~/other a.txt ~/svc", True), ("mv -t ~/svc/data a.txt", True),
+                ("python3 ~/svc2/run.py", False), ("mv -t ~/other ~/svc", True), ("mv -t ~/other a.txt ~/svc", True), ("mv -vt /x ~/svc", True),
+                ("rsync --remove-source-files -a ~/svc/ /x/", True), ("rsync -a ~/svc/ /x/", False),
+                ("mv --target-directory=~/svc/data a.txt", True), ("mv -t ~/svc/data a.txt", True),
                 ("mv --target-directory=~/other ~/svc/allow.json", True), ("rsync -a --delete src/ ~/", True),
                 ("rsync -a src/ ~/other/", False), ("systemctl --user link /x/svc-listen.service", True),
                 ("systemctl --user isolate default.target", True), ("systemctl --user preset-all", True),

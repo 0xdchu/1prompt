@@ -470,9 +470,11 @@ def check_boundary(name, args, words, command):
             check_boundary(program(tail[j]), tail[j + 1:], words, command)
         return
     if name in ("rm", "rmdir", "unlink", "mv", "truncate", "shred", "touch", "install", "chmod", "chown"):
-        takes_dir = [j for j, a in enumerate(args[:-1]) if a == "--target-directory" or re.fullmatch(r"-[a-zA-Z]*t", a)]
+        moves = name in ("mv", "install")  # only these take -t <dir>; chmod -rwxt is a mode
+        takes_dir = [j for j, a in enumerate(args[:-1]) if moves and (a == "--target-directory" or re.fullmatch(r"-[a-zA-Z]*t", a))]
         target_dir = [args[j + 1] for j in takes_dir] + \
-            [a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")]
+            [a.split("=", 1)[1] for a in args if moves and a.startswith("--target-directory=")] + \
+            [m.group(1) for a in args if moves and (m := re.fullmatch(r"-[a-zA-Z]*t(.+)", a))]
         named = [a for j, a in enumerate(args) if not a.startswith("-") and j - 1 not in takes_dir]
         for j, a in enumerate(named):  # the target of mv/install is written into, not taken away; with -t every name is a source
             last = name in ("mv", "install") and not target_dir and j == len(named) - 1 and j
@@ -2464,7 +2466,8 @@ def host_list_test():
                 ("cat ~/svc/allow.json", False), ("ls ~/svc/data", False), ("grep -c x ~/svc/data/q.json", False),
                 ("systemctl --user status svc-listen", False), ("systemctl --user stop third-unit", False),
                 ("echo x > ~/other/notes.txt", False), ("rm -rf ~/other", False), ("touch ~/svc2/x.txt", False),
-                ("python3 ~/svc2/run.py", False), ("mv -t ~/other ~/svc", True), ("mv -t ~/other a.txt ~/svc", True), ("mv -vt /x ~/svc", True),
+                ("python3 ~/svc2/run.py", False), ("mv -t ~/other ~/svc", True), ("mv -t ~/other a.txt ~/svc", True), ("mv -vt /x ~/svc", True), ("mv -t/x a.txt ~/svc", True), ("chmod -R -rwxt ~/svc", True),
+                ("chmod -R -rwxt ~/other", False),
                 ("rsync --remove-source-files -a ~/svc/ /x/", True), ("rsync -a ~/svc/ /x/", False),
                 ("mv --target-directory=~/svc/data a.txt", True), ("mv -t ~/svc/data a.txt", True),
                 ("mv --target-directory=~/other ~/svc/allow.json", True), ("rsync -a --delete src/ ~/", True),

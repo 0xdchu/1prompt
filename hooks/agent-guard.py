@@ -26,6 +26,8 @@ back to the agent; anything else exits 0 and the normal permission flow applies.
 Git and gh commands are checked by reading the command line, which catches mistakes, not an agent that tries to
 get around it. File changes by a reviewer are not guessed from the command: the work tree is compared before and
 after, so any writer is caught (an interpreter, a build script), except files git ignores (build output).
+Boundary mode also reads the owner's host list, ~/.claude/boundary-paths.txt (paths outside every repo and systemd
+user units an autonomous run leaves alone; see host_entries and the README).
 When it cannot parse a command or its input, it blocks it. If `python3` itself is missing the shell exits 127,
 which Claude Code does not treat as a block. Standard library only.
 """
@@ -310,7 +312,7 @@ def check(command, mode):
         if mode == "boundary":
             for target in targets + (cmd[1:] if cmd[:1] == ["tee"] else []):
                 if not target.startswith("-"):
-                    boundary_path(target, CONTEXT["cwd"])
+                    boundary_path(target, CONTEXT["cwd"], holds=False)
         if not cmd:
             continue
         name, args = cmd[0], cmd[1:]
@@ -360,14 +362,23 @@ SECRET_PATH = re.compile(r"(^|[/=])\.ssh/|id_(rsa|ed25519|ecdsa|dsa)\b|\.(pem|p1
                          r"(^|/)secrets?/|\.config/gh/hosts\.yml|\.netrc|\.git-credentials|\.npmrc|\.pypirc|"
                          r"\.docker/config\.json|\.beads-credential-key|(^|/)\.env(\.local|\.production|\.development)?$")
 # the guard's own wiring: an autonomous run never edits it
-GUARD_PATH = re.compile(r"\.claude/(settings[^/]*\.json|hooks(/|$)|agents(/|$)|boundary-paths\.txt$)|1prompt/hooks/|"
+GUARD_PATH = re.compile(r"\.claude/(settings[^/]*\.json|hooks(/|$)|agents(/|$)|boundary-paths\.txt(?![\w.]))|1prompt/hooks/|"
                         r"(^|/)\.claude/boundary\.json$")
 # The owner's host paths and user units outside every repo (a service the run must not reconfigure, its allowlist,
 # its budget ledger): one entry per line, `#` comments. `unit:<name>` names a systemd user unit; `nowatch:<path>` is
 # refused as a write target but not fingerprinted (a folder another process keeps writing while a run goes on).
 HOST_LIST = "~/.claude/boundary-paths.txt"
-UNIT_CHANGE = {"stop", "disable", "mask", "kill", "edit", "revert", "restart", "try-restart", "reload-or-restart",
-               "set-property", "link", "enable", "preset", "reenable", "freeze"}
+# systemctl verbs that only read; any other verb on a listed unit is refused, and these stop every unit at once
+SYSTEMCTL_READ = {"status", "show", "cat", "is-active", "is-enabled", "is-failed", "is-system-running", "list-units",
+                  "list-unit-files", "list-dependencies", "list-timers", "list-sockets", "list-jobs", "list-paths",
+                  "list-automounts", "help", "show-environment", "get-default"}
+SYSTEMCTL_ALL = {"exit", "isolate", "halt", "poweroff", "reboot", "soft-reboot", "kexec", "switch-root", "default",
+                 "rescue", "emergency", "suspend", "hibernate"}
+SYSTEMCTL_VALUE = {"-t", "--type", "-s", "--signal", "--job-mode", "-p", "--property", "-H", "--host", "-M",
+                   "--machine", "--root", "-n", "--lines", "-o", "--output", "--what", "--state", "--kill-whom",
+                   "--kill-value", "--timestamp", "--image", "--drop-in", "--reboot-argument", "--message", "--when",
+                   "--preset-mode"}
+INTERPRETER = re.compile(r"(python|node|perl|ruby|php|deno|bun|lua|osascript)[\d.]*$")
 RUNNERS = {"npx": 1, "bunx": 1, "uvx": 1, "xcrun": 1, ("pnpm", "dlx"): 1, ("pipx", "run"): 1, ("uv", "run"): 1,
            ("poetry", "run"): 1, ("npm", "exec"): 1, ("yarn", "dlx"): 1}
 RUN_TARGETS = set(PUBLISH) | SIGNERS | {"gpg", "openssl", "git", "gh", "bd", "vercel", "netlify", "dotnet", "rm",
@@ -440,7 +451,8 @@ def check_boundary(name, args, words, command):
             raise Blocked(f"`{w}` is key or credential material; in an autonomous run only the owner handles it")
         if GUARD_PATH.search(w) and name not in READERS:
             raise Blocked(f"`{w}` is part of the guard's own wiring; an autonomous run does not change it")
-        listed = host_named(w) if name not in READERS else None
+        listed = host_named(w) if name not in READERS and (INTERPRETER.match(name) or not re.search(r"\s", w)) \
+            else None  # a message or PR body with spaces only names a path; an interpreter's code may write it
         if listed:
             raise Blocked(f"`{name}` names {listed}, which the owner listed in {HOST_LIST}; an autonomous run only "
                           "reads it (cat, grep, ls…)")
@@ -458,15 +470,15 @@ def check_boundary(name, args, words, command):
             check_boundary(program(tail[j]), tail[j + 1:], words, command)
         return
     if name in ("rm", "rmdir", "unlink", "mv", "truncate", "shred", "touch", "install", "chmod", "chown"):
-        for a in args:
-            if not a.startswith("-"):
-                boundary_path(a, CONTEXT["cwd"])
+        named = [a for a in args if not a.startswith("-")]
+        for j, a in enumerate(named):  # the target of mv/install is written into, not taken away
+            boundary_path(a, CONTEXT["cwd"], holds=not (name in ("mv", "install") and j == len(named) - 1 and j))
     if name == "ln" and [a for a in args if not a.startswith("-")]:
-        boundary_path([a for a in args if not a.startswith("-")][-1], CONTEXT["cwd"])  # the link written, not its target
+        boundary_path([a for a in args if not a.startswith("-")][-1], CONTEXT["cwd"], holds=False)  # the link written
     if name in ("cp", "rsync", "dd") and args:
         target = [a for a in args if not a.startswith("-")][-1:] or [""]
         target = [a[3:] for a in args if a.startswith("of=")] or target
-        boundary_path(target[0], CONTEXT["cwd"]) if target[0] else None
+        boundary_path(target[0], CONTEXT["cwd"], holds=False) if target[0] else None
     if name in ("sed", "perl") and any(re.fullmatch(r"-[a-zA-Z]*i.*|--in-place.*", a) for a in args):
         files = [a for a in args if not a.startswith("-")]
         for a in files[0 if "-e" in args or "-pe" in args else 1:]:
@@ -755,7 +767,7 @@ def boundary_edit(event):
     path = tool.get("file_path") or tool.get("notebook_path") or ""
     if not isinstance(path, str) or not path:
         raise TypeError("no file path in the edit")
-    boundary_path(path, event.get("cwd") or ".")
+    boundary_path(path, event.get("cwd") or ".", holds=False)
 
 
 def boundary_config(top):
@@ -864,35 +876,38 @@ def guard_fingerprint():
         name = os.path.relpath(path, home)
         if (name.startswith("settings") and name.endswith(".json")) or name.startswith(("hooks", "agents")) or \
                 name == os.path.basename(HOST_LIST):
-            try:
-                with open(path, "rb") as f:
-                    digest.update(name.encode() + b"\0" + f.read())
-                names.append(name)
-            except OSError:
-                digest.update(f"unreadable {name}".encode())
+            names.append(f"{name} {file_digest(path)}")
     try:
-        listed = [p for p, watched in host_entries()[0] if watched]
+        entries = host_entries()[0]
     except Blocked:
-        listed = []
-        digest.update(b"unreadable host list")
-    for top in listed:
+        entries = []
+        names.append(f"{HOST_LIST} unreadable")
+    skip = [real for real, _, watched in entries if not watched]
+    for top in sorted({real for real, _, watched in entries if watched}):
         found = [top] if not os.path.isdir(top) else sorted(
             os.path.join(root, n) for root, _, ns in os.walk(top) for n in ns)
         for path in found:
-            try:
-                with open(path, "rb") as f:
-                    digest.update(f"host:{path}".encode() + b"\0" + f.read())
-                names.append(f"host:{path}")
-            except FileNotFoundError:
-                digest.update(f"missing {path}".encode())
-            except OSError:
-                digest.update(f"unreadable {path}".encode())
+            if not any(path == s or path.startswith(s.rstrip(os.sep) + os.sep) for s in skip):
+                names.append(f"host:{path} {file_digest(path)}")
+    for name in names:
+        digest.update(name.encode() + b"\0")
     return {"status": names, "digest": digest.hexdigest()}
 
 
+def file_digest(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+
+
 def host_entries():
-    """The owner's host list: ([(real path, watched)], [unit names]). A missing list is empty; one that cannot be read
-    or holds a relative path blocks, like any input the guard cannot parse."""
+    """The owner's host list: ([(real path, path as listed, watched)], [unit names]). A listed unit also protects its
+    unit file and drop-in folder in ~/.config/systemd/user. A missing list is empty; one that cannot be read or holds a
+    relative path blocks every command but reading, like any input the guard cannot parse."""
     try:
         with open(os.path.expanduser(HOST_LIST), encoding="utf-8") as f:
             lines = f.read().splitlines()
@@ -902,65 +917,99 @@ def host_entries():
         raise Blocked(f"could not read {HOST_LIST} ({type(e).__name__}); the owner's host paths cannot be checked")
     paths, units = [], []
     for raw in lines:
-        line = raw.strip()
+        line = re.split(r"\s+#", raw.strip(), maxsplit=1)[0].strip()  # `path  # note`: the note is not part of it
         if not line or line.startswith("#"):
             continue
         if line.startswith("unit:"):
-            units.append(line[5:].strip())
+            unit = line[5:].strip()
+            unit = unit if "." in unit else unit + ".service"
+            units.append(unit)
+            for name in (unit, unit + ".d"):
+                path = os.path.join(os.path.expanduser("~/.config/systemd/user"), name)
+                paths.append((os.path.realpath(path), path, True))
             continue
         watched = not line.startswith("nowatch:")
         path = os.path.expanduser(line if watched else line[8:].strip())
         if not os.path.isabs(path):
             raise Blocked(f"{HOST_LIST}: {line!r} is not an absolute path")
-        paths.append((os.path.realpath(path), watched))
+        paths.append((os.path.realpath(path), os.path.normpath(path), watched))
     return paths, units
 
 
 def host_forms(path):
-    """How a command can spell a listed path: as is, and from home as `~/x` and `$HOME/x`."""
-    home = os.path.realpath(os.path.expanduser("~"))
-    forms = [path]
-    if path.startswith(home + os.sep):
-        rel = path[len(home) + 1:]
-        forms += [f"~/{rel}", f"$HOME/{rel}", f"${{HOME}}/{rel}"]
+    """How a command can spell a listed path: as is, and from home as `~/x`, `$HOME/x` and `${HOME}/x`."""
+    forms = {path}
+    for home in {os.path.expanduser("~"), os.path.realpath(os.path.expanduser("~"))}:
+        if path.startswith(home.rstrip(os.sep) + os.sep):
+            rel = path[len(home.rstrip(os.sep)) + 1:]
+            forms |= {f"~/{rel}", f"$HOME/{rel}", f"${{HOME}}/{rel}"}
     return forms
 
 
 def host_named(word):
-    """The listed path a command word names (also inside a longer string such as python -c "open('...')")."""
-    for path, _ in host_entries()[0]:
-        if any(form in word for form in host_forms(path)):
-            return path
+    """The listed path a command word names, as a whole path or a path inside it (also inside a string such as
+    python -c "open('...')"); `~/svc2` does not name `~/svc`."""
+    for real, spelled, _ in host_entries()[0]:
+        for form in host_forms(real) | host_forms(spelled):
+            if re.search(r"(?<![\w.~/$-])" + re.escape(form) + r"(?![\w.-])", word):
+                return real
     return None
 
 
 def host_unit(args):
-    """`systemctl --user stop|disable|edit… <unit>` of a unit the owner listed."""
+    """The listed unit a `systemctl` call would stop or reconfigure, or None. Read-only verbs pass; a verb that
+    stops every unit (exit, isolate, poweroff…) counts for all of them; unit names may be globs or unit-file paths."""
     units = host_entries()[1]
-    verbs = [a for a in args if not a.startswith("-")]
-    if not units or not verbs or verbs[0] not in UNIT_CHANGE:
+    words, j = [], 0
+    while j < len(args):
+        a = args[j]
+        if a.startswith("-"):
+            j += 2 if a in SYSTEMCTL_VALUE else 1
+            continue
+        words.append(a)
+        j += 1
+    if not units or not words or words[0] in SYSTEMCTL_READ:
         return None
-    for name in verbs[1:]:
+    if words[0] in SYSTEMCTL_ALL:
+        return units[0]
+    for name in words[1:]:
+        base = os.path.basename(name)
+        base = base if "." in base or re.search(r"[*?\[]", base) else base + ".service"
         for unit in units:
-            if name in (unit, unit + ".service") or unit == name + ".service":
+            if fnmatch(unit, base) or fnmatch(unit, os.path.basename(name)):
                 return unit
     return None
 
 
-def boundary_path(path, cwd):
-    """A path about to be written (an edit, a redirect, tee): the guard's wiring, key files and protected paths."""
+def host_check(full, path, holds):
+    """A write target at or under a listed path, or (holds) a folder or glob that takes one with it (`rm -rf ~/sv*`)."""
+    glob = bool(re.search(r"[*?\[]", full))
+    for real, spelled, _ in host_entries()[0]:
+        for listed in {real, spelled}:
+            ancestors = [listed]
+            while os.path.dirname(ancestors[-1]) != ancestors[-1]:
+                ancestors.append(os.path.dirname(ancestors[-1]))
+            hit = full == listed or full.startswith(listed.rstrip(os.sep) + os.sep) or \
+                (holds and full in ancestors) or \
+                (glob and (fnmatch(listed, full) or (holds and any(fnmatch(a, full) for a in ancestors))))
+            if hit:
+                raise Blocked(f"{path} is or holds {real}, which the owner listed in {HOST_LIST}; an autonomous run "
+                              "does not change it")
+
+
+def boundary_path(path, cwd, holds=True):
+    """A path about to be written (an edit, a redirect, tee): the guard's wiring, key files and protected paths.
+    `holds`: a folder that holds a listed host path counts too (rm, chmod); a copy or edit target only counts when
+    it is or is under one."""
     if path in ("/dev/null", "/dev/stdout", "/dev/stderr") or path.startswith("&"):
         return
-    full = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
+    spelled = re.sub(r"^\$(HOME\b|\{HOME\})", "~", path)
+    full = os.path.realpath(os.path.join(cwd, os.path.expanduser(spelled)))
     if GUARD_PATH.search(full):
         raise Blocked(f"{path} is part of the guard's own wiring; an autonomous run does not change it")
     if SECRET_PATH.search(full):
         raise Blocked(f"{path} is key or credential material; in an autonomous run only the owner handles it")
-    for listed, _ in host_entries()[0]:
-        if full == listed or full.startswith(listed.rstrip(os.sep) + os.sep) or full == os.sep or \
-                listed.startswith(full.rstrip(os.sep) + os.sep):
-            raise Blocked(f"{path} is or holds {listed}, which the owner listed in {HOST_LIST}; an autonomous run "
-                          "does not change it")
+    host_check(full, path, holds)
     top = work_tree(full)
     if not top:
         return
@@ -2311,18 +2360,28 @@ def contract_test():
 
 def host_list_test():
     """The owner's host list on a scratch home: listed paths and units are refused as write targets, in edits, in
-    command words and in systemctl; reading passes; a watched path changed by an interpreter is reported, a nowatch
-    folder is not, and neither is anything when the list is absent."""
+    command words and in systemctl; reading, look-alike names, messages and copies into home pass; a watched path
+    changed by an interpreter is reported by name, a nowatch folder is not (also nested in a watched one), and a list
+    that cannot be read blocks every command but reading."""
     bad, saved_home, saved_cwd = [], os.environ.get("HOME"), CONTEXT["cwd"]
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.realpath(os.path.join(tmp, "home"))
         os.environ["HOME"] = home
-        for folder in (".claude", "svc/data", "other"):
+        for folder in (".claude", "svc/data", "svc2", "other", "wfold/inner", ".config/systemd/user"):
             os.makedirs(os.path.join(home, folder))
-        for rel in ("svc/allow.json", "svc/data/q.json", ".claude/settings.json"):
+        for rel in ("svc/allow.json", "svc/data/q.json", ".claude/settings.json", "wfold/a.txt", "wfold/inner/b.txt",
+                    "real.json"):
             with open(os.path.join(home, rel), "w") as f:
                 f.write("{}")
+        os.symlink(os.path.join(home, "svc"), os.path.join(home, "lnk"))
         CONTEXT["cwd"] = os.path.join(home, "other")
+        listing = os.path.join(home, ".claude", "boundary-paths.txt")
+
+        def write_list(text):
+            if os.path.isdir(listing):
+                os.rmdir(listing)
+            with open(listing, "w") as f:
+                f.write(text)
 
         def expect(label, call, want):
             try:
@@ -2336,47 +2395,83 @@ def host_list_test():
         def edit(path):
             return lambda: boundary_edit({"cwd": CONTEXT["cwd"], "tool_input": {"file_path": path}})
 
-        expect("an edit with no list", edit("~/svc/allow.json"), False)
-        expect("a stop with no list", lambda: check("systemctl --user stop svc-listen", "boundary"), False)
-        with open(os.path.join(home, ".claude", "boundary-paths.txt"), "w") as f:
-            f.write("# owner's list\n~/svc/allow.json\nnowatch:~/svc/data\nunit:svc-listen\n")
-        for label, call in (("an edit of a listed file", edit("~/svc/allow.json")),
-                            ("a write into a nowatch folder", edit(os.path.join(home, "svc/data/new.json"))),
-                            ("an edit of the list itself", edit("~/.claude/boundary-paths.txt"))):
-            expect(label, call, True)
-        for command, want in (("rm -rf ~/svc", True), ("echo x > ~/svc/allow.json", True),
-                              ("cp a.json ~/svc/data/", True), ("sed -i s/a/b/ ~/svc/allow.json", True),
-                              ("python3 -c \"open('$HOME/svc/allow.json', 'w')\"", True),
-                              (f"python3 tool.py {home}/svc/data/q.json", True),
-                              ("systemctl --user stop svc-listen", True),
-                              ("systemctl --user disable --now svc-listen.service", True),
-                              ("systemctl --user edit svc-listen", True),
-                              ("cat ~/svc/allow.json", False), ("ls ~/svc/data", False),
-                              ("grep -c x ~/svc/data/q.json", False), ("systemctl --user status svc-listen", False),
-                              ("systemctl --user stop other-unit", False), ("echo x > ~/other/notes.txt", False),
-                              ("rm -rf ~/other", False)):
-            expect(repr(command), lambda: check(command, "boundary"), want)
-        expect("an edit elsewhere", edit("~/other/notes.txt"), False)
+        def cmd(command):
+            return lambda: check(command, "boundary")
 
-        def step(label, act, want):
-            event = {"session_id": f"self-test-h-{os.getpid()}-{label[:12]}", "agent_id": "t", "cwd": CONTEXT["cwd"],
-                     "tool_name": "Bash", "tool_input": {"command": "true"}}
+        expect("an edit with no list", edit("~/svc/allow.json"), False)
+        expect("a stop with no list", cmd("systemctl --user stop svc-listen"), False)
+        write_list("# owner's list\n~/svc/allow.json  # allowlist\nnowatch:~/svc/data\n~/wfold\nnowatch:~/wfold/inner\n"
+                   f"~/lnk/linked.json\n{home}/real.json\nunit:other-unit.service # note\nunit:svc-listen\n")
+        for label, call, want in (
+                ("an edit of a listed file", edit("~/svc/allow.json"), True),
+                ("a write into a nowatch folder", edit(os.path.join(home, "svc/data/new.json")), True),
+                ("an edit of the list itself", edit("~/.claude/boundary-paths.txt"), True),
+                ("an edit through the realpath of a symlinked entry", edit("~/svc/linked.json"), True),
+                ("an edit of a listed unit's file", edit("~/.config/systemd/user/svc-listen.service"), True),
+                ("a drop-in for a listed unit", edit("~/.config/systemd/user/svc-listen.service.d/x.conf"), True),
+                ("an edit of a look-alike folder", edit("~/svc2/x.txt"), False),
+                ("an edit of a look-alike file", edit("~/svc/allow.json.bak"), False),
+                ("an edit of a look-alike of a nowatch folder", edit("~/svc/data2/x.json"), False),
+                ("a write target that is a folder holding a listed path", edit("~/svc"), False),
+                ("an edit elsewhere", edit("~/other/notes.txt"), False)):
+            expect(label, call, want)
+        for command, want in (
+                ("rm -rf ~/svc", True), ("rm -rf /", True), ("rm -rf ~/sv*", True), ("rm -rf $HOME", True),
+                ("chmod -R 700 ~", True), ("echo x > ~/svc/allow.json", True), ("cp a.json ~/svc/data/", True),
+                ("sed -i s/a/b/ ~/svc/allow.json", True), ("python3 -c \"open('$HOME/svc/allow.json', 'w')\"", True),
+                ("python3 -c \"open('${HOME}/svc/allow.json', 'w')\"", True),
+                (f"python3 tool.py {home}/svc/data/q.json", True), ("python3 tool.py ~/svc/data/q.json", True),
+                ("python3 tool.py ~/lnk/linked.json", True), ("python3 tool.py ~/real.json", True),
+                ("python3 -c \"open('$HOME/.claude/boundary-paths.txt', 'w')\"", True),
+                ("systemctl --user stop svc-listen", True), ("systemctl --user stop a svc-listen", True),
+                ("systemctl --user disable --now svc-listen.service", True), ("systemctl --user edit svc-listen", True),
+                ("systemctl --user mask svc-listen", True), ("systemctl --user restart svc-listen", True),
+                ("systemctl --user kill svc-listen", True), ("systemctl --user set-property svc-listen CPUQuota=1%", True),
+                ("systemctl --user -t service stop svc-listen", True), ("systemctl --user -s SIGKILL kill svc-listen", True),
+                ("systemctl --user stop 'svc-*'", True), ("systemctl --user try-reload-or-restart svc-listen", True),
+                ("systemctl --user stop other-unit", True), ("systemctl --user exit", True),
+                ("cat ~/svc/allow.json", False), ("ls ~/svc/data", False), ("grep -c x ~/svc/data/q.json", False),
+                ("systemctl --user status svc-listen", False), ("systemctl --user stop third-unit", False),
+                ("echo x > ~/other/notes.txt", False), ("rm -rf ~/other", False), ("touch ~/svc2/x.txt", False),
+                ("python3 ~/svc2/run.py", False), ("python3 tool.py ~/svc/data2/x.json", False),
+                ("python3 tool.py ~/svc/allow.json.bak", False), ("systemctl --user -p Id show svc-listen", False), ("cp a.txt ~/", False), ("mv a.txt ~/", False),
+                ("gh pr create --title t --body 'edits ~/svc/allow.json later'", False)):
+            expect(repr(command), cmd(command), want)
+
+        def step(label, act, want, named=None):
+            event = {"session_id": f"self-test-h-{os.getpid()}-{len(bad)}-{label[:12]}", "agent_id": "t",
+                     "cwd": CONTEXT["cwd"], "tool_name": "Bash", "tool_input": {"command": "true"}}
             watch(event, "boundary")
             act()
             found, _ = changes(event, "boundary")
             if bool(found) != want:
                 bad.append(f"host watch: {label} {'reported' if found else 'not reported'}, expected the opposite")
+            if named and not any(named in entry for entries in found.values() for entry in entries):
+                bad.append(f"host watch: {label} reported without naming {named}: {found}")
             os.remove(state_file(event, "boundary"))
 
         def append(rel):
             return lambda: open(os.path.join(home, rel), "a").write(" ")
-        step("a watched file written by an interpreter", append("svc/allow.json"), True)
+
+        def create(rel):
+            return lambda: open(os.path.join(home, rel), "w").write("{}")
+        step("a watched file written by an interpreter", append("svc/allow.json"), True, "svc/allow.json")
+        step("a file in a watched folder", append("wfold/a.txt"), True, "wfold/a.txt")
+        step("a nowatch folder inside a watched one", append("wfold/inner/b.txt"), False)
         step("a file in a nowatch folder", append("svc/data/q.json"), False)
         step("a file nobody listed", append("other/x.txt"), False)
-        step("the list itself", append(".claude/boundary-paths.txt"), True)
-        with open(os.path.join(home, ".claude", "boundary-paths.txt"), "w") as f:
-            f.write("svc/relative\n")
+        step("a listed path that did not exist", create("svc/linked.json"), True, "svc/linked.json")
+        step("a listed unit file created", create(".config/systemd/user/svc-listen.service"), True)
+        step("the list itself", append(".claude/boundary-paths.txt"), True, "boundary-paths.txt")
+        write_list("svc/relative\n")
         expect("any write while the list holds a relative path", edit("~/other/notes.txt"), True)
+        expect("git status while the list holds a relative path", cmd("git status"), True)
+        expect("reading while the list holds a relative path", cmd("cat ~/other/x.txt"), False)
+        os.remove(listing)
+        os.mkdir(listing)  # a list that cannot be read
+        expect("a write while the list cannot be read", edit("~/other/notes.txt"), True)
+        if "boundary-paths.txt unreadable" not in " ".join(guard_fingerprint()["status"]):
+            bad.append("host watch: an unreadable list is not named in the guard fingerprint")
     if saved_home is None:
         os.environ.pop("HOME", None)
     else:

@@ -78,12 +78,15 @@ or reconfigure, keep a list in `~/.claude/boundary-paths.txt`. Put one entry on 
 ~/.config/my-service/allowlist.json
 # refused as a write target but not watched: another process writes there while a run goes on
 nowatch:~/.local/share/my-service
-# a systemd user unit: stop, disable, mask, edit, restart and the like are refused (status and show pass)
+# a systemd user unit: every systemctl verb but the read-only ones (status, show, cat, is-active, list-…) is
+# refused, and so are verbs that stop every unit (exit, isolate); its unit file and drop-in folder in
+# ~/.config/systemd/user are protected like a listed path
 unit:my-service.service
 ```
 
-The list is part of the guard's wiring: a run cannot edit it, and any change to it is reported. If the list cannot be
-read, or a line holds a relative path, writes are refused until you fix it.
+A note after a path needs a space before the `#`. The list is part of the guard's wiring: a run cannot edit it, and
+any change to it is reported, naming the file. If the list cannot be read, or a line holds a relative path, every
+command but reading (`cat`, `ls`, `grep`…) is refused until you fix it.
 
 ## Build and review modes in a subagent
 
@@ -144,9 +147,11 @@ reviewer report any change to it. The module docstring in `hooks/agent-guard.py`
   rights cannot change them. Set them with `scripts/github-boundary.py` (see its docstring; `--apply` writes as the
   owner account only). GitHub refuses rulesets on private repos without a paid plan; the script reports that.
 - Work-tree watches compare git state before and after, so files git ignores (build output) are not covered.
-- The host list in `~/.claude/boundary-paths.txt` is checked the same way: a command that spells a listed path
-  some other way (a variable, a relative path from elsewhere, a symlink), or a `nowatch:` folder written by an
-  interpreter, gets past it.
+- The host list in `~/.claude/boundary-paths.txt` is checked the same way. A command that spells a listed path
+  some other way (a variable other than `$HOME`, a brace expansion, a symlink you made yourself), or an interpreter
+  that writes into a `nowatch:` folder, gets past it; a watched path is still reported after the call. Paths are
+  compared case-sensitively and from `HOME`, so on Windows and macOS, where file names ignore case, spell them as they
+  are on disk.
 - The task contract sees a tree once a call names it (its cwd, a path argument, an absolute path or a `cd` in a
   command); a write into a tree no call ever names, or a shell write outside every git tree, is not seen. Its state
   lives in the temp folder, where a builder working to get around it could change it.

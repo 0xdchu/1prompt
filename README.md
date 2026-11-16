@@ -67,6 +67,27 @@ claude --settings hooks/autonomous-settings.json
 The file is not loaded in interactive sessions, where you are present, so they behave as before. The hooks apply
 to the main session and to every subagent of the run.
 
+### Paths outside your repos
+
+Protected paths in a repo come from `.claude/boundary.json`. For files outside every repo that an unattended run
+must leave alone (a service's allowlist, its budget ledger, its installed code) and user services it must not stop
+or reconfigure, keep a list in `~/.claude/boundary-paths.txt`. Put one entry on each line and start a comment with `#`:
+
+```text
+# a file or folder: refused as a write target, and any change to it is reported after each tool call
+~/.config/my-service/allowlist.json
+# refused as a write target but not watched: another process writes there while a run goes on
+nowatch:~/.local/share/my-service
+# a systemd user unit: every systemctl verb but the read-only ones (status, show, cat, is-active, list-…) is
+# refused, and so are verbs that act on every unit (exit, isolate, preset-all); its unit file and every drop-in
+# folder systemd reads for it in ~/.config/systemd/user are protected like a listed path
+unit:my-service.service
+```
+
+A note after a path needs a space before the `#`. The list is part of the guard's wiring: a run cannot edit it, and
+any change to it is reported, naming the file. If the list cannot be read, or a line holds a relative path, every
+command but reading (`cat`, `ls`, `grep`…) is refused until you fix it.
+
 ## Build and review modes in a subagent
 
 A builder or reviewer subagent can carry the stricter hooks in its own frontmatter. For a builder
@@ -126,6 +147,12 @@ reviewer report any change to it. The module docstring in `hooks/agent-guard.py`
   rights cannot change them. Set them with `scripts/github-boundary.py` (see its docstring; `--apply` writes as the
   owner account only). GitHub refuses rulesets on private repos without a paid plan; the script reports that.
 - Work-tree watches compare git state before and after, so files git ignores (build output) are not covered.
+- The host list in `~/.claude/boundary-paths.txt` is checked the same way. A command that spells a listed path
+  some other way (a variable other than `$HOME`, a brace expansion, a symlink you made yourself), or an interpreter
+  that writes into a `nowatch:` folder, gets past it; a watched path is still reported after the call. Paths are
+  compared case-sensitively and from `HOME`, so on Windows and macOS, where file names ignore case, spell them as they
+  are on disk. For units only `systemctl` is read: `kill`/`pkill`, `busctl` or `loginctl` reach a unit past it, and a
+  unit's files are looked for in `$XDG_CONFIG_HOME` (or `~/.config`) `/systemd/user` only.
 - The task contract sees a tree once a call names it (its cwd, a path argument, an absolute path or a `cd` in a
   command); a write into a tree no call ever names, or a shell write outside every git tree, is not seen. Its state
   lives in the temp folder, where a builder working to get around it could change it.
